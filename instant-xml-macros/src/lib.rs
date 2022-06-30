@@ -2,7 +2,7 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use quote::quote;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use syn::{parse_macro_input, Lit, Meta, NestedMeta};
 
 const XML: &str = "xml";
@@ -54,6 +54,13 @@ impl<'a> Serializer {
         }
     }
 
+    fn get_keys_set(&self) -> BTreeSet<&str> {
+        self.other_namespaces
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect()
+    }
+
     fn add_header(&mut self, root_name: &str, output: &'a mut proc_macro2::TokenStream) {
         output.extend(quote!(+ "<" + #root_name));
 
@@ -79,6 +86,7 @@ impl<'a> Serializer {
         &mut self,
         field: &syn::Field,
         output: &'a mut proc_macro2::TokenStream,
+        missing_prefixes: &'a mut BTreeSet<String>,
     ) {
         let field_name = field.ident.as_ref().unwrap().to_string();
         let field_value = field.ident.as_ref().unwrap();
@@ -88,16 +96,12 @@ impl<'a> Serializer {
             Some(FieldAttribute::Namespace(namespace)) => {
                 output.extend(quote!(+ "<" + #field_name + " xmlns=\"" + #namespace + "\""));
             }
-            Some(FieldAttribute::PrefixIdentifier(prefix_key))
-                if !self.other_namespaces.is_empty() =>
-            {
-                match self.other_namespaces.get(&prefix_key) {
-                    Some(_) => {
-                        prefix = prefix_key + ":";
-                        output.extend(quote!(+ "<" + #prefix + #field_name));
-                    }
-                    None => todo!(), // return the error
+            Some(FieldAttribute::PrefixIdentifier(prefix_key)) => {
+                output.extend(quote!(+ "<" + #prefix_key + ":" + #field_name));
+                if self.other_namespaces.get(&prefix_key).is_none() {
+                    missing_prefixes.insert(prefix_key.clone());
                 };
+                prefix = prefix_key + ":";
             }
             _ => {
                 // Without the namespace
@@ -106,7 +110,7 @@ impl<'a> Serializer {
         };
 
         output.extend(
-            quote!(+ ">" + self.#field_value.to_string().as_str() + "</" + #prefix + #field_name + ">"),
+            quote!(+ ">" + self.#field_value.to_xml(Some(child_prefixes)).unwrap().as_str() + "</" + #prefix + #field_name + ">"),
         );
     }
 
@@ -156,10 +160,10 @@ impl<'a> Serializer {
 #[proc_macro_derive(ToXml, attributes(xml))]
 pub fn to_xml(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as syn::DeriveInput);
-
     let ident = &ast.ident;
     let root_name = ident.to_string();
     let mut output: proc_macro2::TokenStream = TokenStream::from(quote!("".to_owned())).into();
+    let mut missing_prefixes = BTreeSet::new();
 
     let mut serializer = Serializer::new(&ast.attrs);
     serializer.add_header(&root_name, &mut output);
@@ -169,7 +173,7 @@ pub fn to_xml(input: TokenStream) -> TokenStream {
             match data.fields {
                 syn::Fields::Named(ref fields) => {
                     fields.named.iter().for_each(|field| {
-                        serializer.process_named_field(field, &mut output);
+                        serializer.process_named_field(field, &mut output, &mut missing_prefixes);
                     });
                 }
                 syn::Fields::Unnamed(_) => todo!(),
@@ -181,13 +185,47 @@ pub fn to_xml(input: TokenStream) -> TokenStream {
 
     serializer.add_footer(&root_name, &mut output);
 
+    let current_prefixes: BTreeSet<&str> = serializer.get_keys_set();
     TokenStream::from(quote!(
         impl ToXml for #ident {
-            fn write_xml<W: ::std::fmt::Write>(&self, write: &mut W) -> Result<(), instant_xml::Error> {
-                write.write_str(&(#output))?;
+            fn write_xml<W: ::std::fmt::Write>(&self, write: &mut W, parent_prefixes: Option<&mut std::collections::BTreeSet<&str>>) -> Result<(), instant_xml::Error> {
+                match parent_prefixes {
+                    Some(child_prefixes) => {
+                        let mut to_remove: Vec<&str> = Vec::new();
+                        #(if child_prefixes.insert(#current_prefixes) {
+                            to_remove.push(#current_prefixes);
+                        };)*;
+                        write.write_str(&(#output))?;
+
+                        for it in to_remove {
+                            child_prefixes.remove(it);
+                        }
+                    },
+                    None => {
+                        let mut set = std::collections::BTreeSet::<&str>::new();
+                        let child_prefixes = &mut set;
+                        #(child_prefixes.insert(#current_prefixes);)*;
+                        write.write_str(&(#output))?;
+                    }
+                }
                 Ok(())
             }
-        }
+
+            fn to_xml(&self, parent_prefixes: Option<&mut std::collections::BTreeSet<&str>>) -> Result<String, instant_xml::Error> {
+                //#(println!("{}", #missing_prefixes);)*;
+                if let Some(parent_prefixes) = parent_prefixes.as_ref() {
+                    #(
+                        if parent_prefixes.get(#missing_prefixes).is_none() {
+                            panic!("wrong prefix");
+                        }
+                    )*;
+                }
+
+                let mut out = String::new();
+                self.write_xml(&mut out, parent_prefixes)?;
+                Ok(out)
+            }
+        };
     ))
 }
 
