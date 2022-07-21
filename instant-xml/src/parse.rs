@@ -1,48 +1,110 @@
-use xmlparser::{ElementEnd, Token};
+use crate::Error;
+pub use crate::{TagData, XmlRecord};
+use std::iter::Peekable;
+use xmlparser::{ElementEnd, Token, Tokenizer};
 
-use super::Error;
+pub struct XmlParser<'a> {
+    stack: Vec<String>,
+    internal_iter: Peekable<Tokenizer<'a>>,
+}
 
-impl<'a> Parse for Option<Result<xmlparser::Token<'a>, xmlparser::Error>> {
-    fn element_start(self, ns: Option<&str>, tag: &str) -> Result<(), Error> {
-        match self {
-            Some(Ok(Token::ElementStart { prefix, local, .. })) => {
-                let prefix_ns = prefix.as_str();
-                let (has_prefix, expect_prefix) = (!prefix_ns.is_empty(), ns.is_some());
-                if has_prefix != expect_prefix {
-                    return dbg!(Err(Error::UnexpectedValue));
-                }
-
-                if has_prefix && Some(prefix_ns) != ns {
-                    return dbg!(Err(Error::UnexpectedValue));
-                }
-
-                if local.as_str() != tag {
-                    return dbg!(Err(Error::UnexpectedValue));
-                }
-
-                Ok(())
-            }
-            Some(Ok(_)) => Err(Error::UnexpectedValue),
-            Some(Err(err)) => Err(err.into()),
-            None => Err(Error::UnexpectedEndOfStream),
+impl<'a> XmlParser<'a> {
+    pub fn new(input: &'a str) -> XmlParser<'a> {
+        XmlParser {
+            stack: Vec::new(),
+            internal_iter: Tokenizer::from(input).peekable(),
         }
     }
 
-    fn element_end(self, _: Option<&str>, _: &str) -> Result<(), Error> {
-        match self {
-            Some(Ok(Token::ElementEnd { end, .. })) => match end {
-                ElementEnd::Open => todo!(),
-                ElementEnd::Close(_, _) => todo!(),
-                ElementEnd::Empty => Ok(()),
-            },
-            Some(Ok(_)) => Err(Error::UnexpectedValue),
-            Some(Err(err)) => Err(err.into()),
-            None => Err(Error::UnexpectedEndOfStream),
+    fn parse_next(&mut self) -> Result<Option<XmlRecord>, Error> {
+        let mut attributes = None;
+        let mut key = String::new();
+
+        loop {
+            let item = match self.internal_iter.next() {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            println!("{:?}", &item);
+            match item {
+                Ok(Token::ElementStart {
+                    prefix: _, local, ..
+                }) => {
+                    key = local.to_string();
+                }
+                Ok(Token::ElementEnd { end, .. }) => {
+                    match end {
+                        ElementEnd::Open => {
+                            self.stack.push(key.to_owned());
+                            println!(
+                                "Stack size after push: {}, top: {:?}",
+                                self.stack.len(),
+                                &key
+                            );
+
+                            return Ok(Some(XmlRecord::Open(TagData { attributes, key })));
+                        }
+                        ElementEnd::Close(..) => {
+                            // TODO: Check if close tag equal to tag in top of stack
+                            let last = self.stack.pop();
+
+                            println!("Stack size after pop: {}", self.stack.len());
+                            return Ok(Some(XmlRecord::Close(last.unwrap())));
+                        }
+                        ElementEnd::Empty => {
+                            todo!();
+                        }
+                    }
+                }
+                Ok(Token::Attribute { prefix: _, .. }) => {
+                    // TODO: Add to attributes map
+                    attributes = Some(Vec::new());
+                }
+                Ok(Token::Text { text }) => {
+                    return Ok(Some(XmlRecord::Element(text.to_string())));
+                }
+                _ => (), // Todo
+            }
+        }
+    }
+
+    pub fn peek_next_tag(&mut self) -> Result<Option<XmlRecord>, Error> {
+        let item = match self.internal_iter.peek() {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        println!("peek: {:?}", &item);
+        match item {
+            Ok(Token::ElementStart {
+                prefix: _, local, ..
+            }) => Ok(Some(XmlRecord::Open(TagData {
+                attributes: None,
+                key: local.to_string(),
+            }))),
+            Ok(Token::ElementEnd { end, .. }) => {
+                if let ElementEnd::Close(..) = end {
+                    return Ok(Some(XmlRecord::Close(
+                        self.stack.last().unwrap().to_string(),
+                    )));
+                }
+                panic!("Wrong end type")
+            }
+            _ => panic!("Wrong token, expected Start or End"),
         }
     }
 }
 
-pub trait Parse {
-    fn element_start(self, ns: Option<&str>, tag: &str) -> Result<(), Error>;
-    fn element_end(self, ns: Option<&str>, tag: &str) -> Result<(), Error>;
+impl<'a> Iterator for XmlParser<'a> {
+    type Item = XmlRecord;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.parse_next() {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => None,
+            Err(_) => todo!(),
+        }
+    }
 }
